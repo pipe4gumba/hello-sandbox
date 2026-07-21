@@ -61,7 +61,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ISSUE: ${{ needs.parse.outputs.issue }}
       AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
-      AGENTPLANE_TOKEN: ${{ secrets.AGENTPLANE_TOKEN }}
+      AGENTPLANE_SSH_KEY: ${{ secrets.AGENTPLANE_SSH_KEY }}
       AGENTPLANE_EVIDENCE_DIR: ${{ github.workspace }}/.agentplane-evidence
     steps:
       - uses: actions/checkout@v4
@@ -69,15 +69,20 @@ jobs:
       - name: Install agentplane
         run: |
           set -euo pipefail
-          # agentplane may itself live in a private repository. When
-          # AGENTPLANE_TOKEN is set, install over an authenticated URL; the
-          # token is never written to a variable or to the log.
+          # agentplane may itself live in a private repository. A read-only
+          # deploy key in AGENTPLANE_SSH_KEY grants exactly that one repo,
+          # and is revocable on its own; without it the install URL is used
+          # as-is, which is right for a public agentplane.
           install="$AGENTPLANE_INSTALL"
-          if [ -n "${AGENTPLANE_TOKEN:-}" ] && [ "${install#git+https://github.com/}" != "$install" ]; then
-            install="git+https://x-access-token:${AGENTPLANE_TOKEN}@github.com/${install#git+https://github.com/}"
+          if [ -n "${AGENTPLANE_SSH_KEY:-}" ]; then
+            key="$RUNNER_TEMP/agentplane_key"
+            umask 077 && printf '%s\n' "$AGENTPLANE_SSH_KEY" > "$key"
+            export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            install="${install/git+https:\/\/github.com\//git+ssh://git@github.com/}"
           fi
           uv venv "$RUNNER_TEMP/apvenv"
           VIRTUAL_ENV="$RUNNER_TEMP/apvenv" uv pip install "$install"
+          rm -f "$RUNNER_TEMP/agentplane_key"
           echo "$RUNNER_TEMP/apvenv/bin" >> "$GITHUB_PATH"
       - name: Run the command
         run: |
