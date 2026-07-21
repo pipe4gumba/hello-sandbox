@@ -1,0 +1,4 @@
+# Globs listed here merge into deny_context (gitignore syntax, one per line).
+# notes/private/**
+# tests/fixtures/large/**
+# vendor/**

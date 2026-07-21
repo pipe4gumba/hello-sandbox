@@ -1,0 +1,214 @@
+# agentplane — the execution workflow.
+#
+# Two entry shapes, one body:
+#   * a human adds `agent:run` to an issue;
+#   * another agentplane workflow calls this one (gate approval, /agent run).
+# Everything downstream of `resolve` is fail-closed: no runner, tool, gate or
+# digest means no execution.
+name: agentplane run
+
+on:
+  issues:
+    types: [labeled]
+  workflow_call:
+    inputs:
+      issue:
+        description: Issue number to execute
+        required: true
+        type: string
+      approved:
+        description: Set true when a plan gate has already been approved
+        required: false
+        default: false
+        type: boolean
+
+# One run per issue. Attempts queue instead of racing over the same worktree.
+concurrency:
+  group: agent-${{ inputs.issue || github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  resolve:
+    # `inputs.issue` is empty on the issues trigger, so this reads as:
+    # called by another workflow, or the label just added was agent:run.
+    if: inputs.issue != '' || github.event.label.name == 'agent:run'
+    runs-on: ubuntu-latest
+    outputs:
+      issue: ${{ inputs.issue || github.event.issue.number }}
+      skip: ${{ steps.guard.outputs.skip }}
+      runner: ${{ steps.bundle.outputs.runner }}
+      tool: ${{ steps.bundle.outputs.tool }}
+      gate: ${{ steps.bundle.outputs.gate }}
+      digest: ${{ steps.bundle.outputs.digest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ inputs.issue || github.event.issue.number }}
+      AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
+      AGENTPLANE_TOKEN: ${{ secrets.AGENTPLANE_TOKEN }}
+    steps:
+      - name: Skip completed issues
+        id: guard
+        run: |
+          set -euo pipefail
+          if gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels \
+               -q '.labels[].name' | grep -qx 'agent:done'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=agentplane::Issue #$ISSUE carries agent:done, so agentplane skipped it. Remove agent:done to run it again."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.guard.outputs.skip != 'true'
+
+      - name: Install agentplane
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # agentplane may itself live in a private repository. When
+          # AGENTPLANE_TOKEN is set, install over an authenticated URL; the
+          # token is never written to a variable or to the log.
+          install="$AGENTPLANE_INSTALL"
+          if [ -n "${AGENTPLANE_TOKEN:-}" ] && [ "${install#git+https://github.com/}" != "$install" ]; then
+            install="git+https://x-access-token:${AGENTPLANE_TOKEN}@github.com/${install#git+https://github.com/}"
+          fi
+          uv venv "$RUNNER_TEMP/apvenv"
+          VIRTUAL_ENV="$RUNNER_TEMP/apvenv" uv pip install "$install"
+          echo "$RUNNER_TEMP/apvenv/bin" >> "$GITHUB_PATH"
+
+      - name: Normalize issue form into a task spec
+        if: steps.guard.outputs.skip != 'true'
+        run: python -m agentplane.surface formsync "$ISSUE"
+
+      - name: Resolve task
+        id: bundle
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          if ! ap resolve "$ISSUE" > bundle.txt 2>&1; then
+            python -m agentplane.surface remediate "$ISSUE" bundle.txt
+            exit 1
+          fi
+          python -m agentplane.surface bundle bundle.txt >> "$GITHUB_OUTPUT"
+
+      - name: Post resolved status
+        if: steps.guard.outputs.skip != 'true'
+        run: python -m agentplane.surface status "$ISSUE" --step running
+
+  # Plan-gate domains stop here: a plan comment is posted for approval and
+  # nothing is executed until gate:approved (or /agent approve) arrives.
+  plan:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true' && needs.resolve.outputs.gate == 'plan' && inputs.approved != true
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ needs.resolve.outputs.issue }}
+      AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
+      AGENTPLANE_TOKEN: ${{ secrets.AGENTPLANE_TOKEN }}
+      AGENTPLANE_EVIDENCE_DIR: ${{ github.workspace }}/.agentplane-evidence
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install agentplane
+        run: |
+          set -euo pipefail
+          # agentplane may itself live in a private repository. When
+          # AGENTPLANE_TOKEN is set, install over an authenticated URL; the
+          # token is never written to a variable or to the log.
+          install="$AGENTPLANE_INSTALL"
+          if [ -n "${AGENTPLANE_TOKEN:-}" ] && [ "${install#git+https://github.com/}" != "$install" ]; then
+            install="git+https://x-access-token:${AGENTPLANE_TOKEN}@github.com/${install#git+https://github.com/}"
+          fi
+          uv venv "$RUNNER_TEMP/apvenv"
+          VIRTUAL_ENV="$RUNNER_TEMP/apvenv" uv pip install "$install"
+          echo "$RUNNER_TEMP/apvenv/bin" >> "$GITHUB_PATH"
+      - name: Post plan for approval
+        run: |
+          mkdir -p "$AGENTPLANE_EVIDENCE_DIR"
+          python -m agentplane.surface plan "$ISSUE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentplane-plan-${{ needs.resolve.outputs.digest }}
+          path: ${{ env.AGENTPLANE_EVIDENCE_DIR }}
+          if-no-files-found: warn
+
+  execute:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true' && (needs.resolve.outputs.gate != 'plan' || inputs.approved == true)
+    # Self-hosted lanes carry the tool binaries and long-lived credentials;
+    # everything else stays on hosted runners.
+    runs-on: ${{ needs.resolve.outputs.runner == 'self-hosted' && 'agent' || 'ubuntu-latest' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ needs.resolve.outputs.issue }}
+      TOOL: ${{ needs.resolve.outputs.tool }}
+      GATE: ${{ needs.resolve.outputs.gate }}
+      AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
+      AGENTPLANE_TOKEN: ${{ secrets.AGENTPLANE_TOKEN }}
+      AGENTPLANE_EVIDENCE_DIR: ${{ github.workspace }}/.agentplane-evidence
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # The gateway's address is configuration (it lives in profiles.yml),
+      # not a credential. Only the key is a secret. A gateway on loopback is
+      # reachable from the self-hosted runner only.
+      LITELLM_KEY: ${{ secrets.LITELLM_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install agentplane
+        run: |
+          set -euo pipefail
+          # agentplane may itself live in a private repository. When
+          # AGENTPLANE_TOKEN is set, install over an authenticated URL; the
+          # token is never written to a variable or to the log.
+          install="$AGENTPLANE_INSTALL"
+          if [ -n "${AGENTPLANE_TOKEN:-}" ] && [ "${install#git+https://github.com/}" != "$install" ]; then
+            install="git+https://x-access-token:${AGENTPLANE_TOKEN}@github.com/${install#git+https://github.com/}"
+          fi
+          uv venv "$RUNNER_TEMP/apvenv"
+          VIRTUAL_ENV="$RUNNER_TEMP/apvenv" uv pip install "$install"
+          echo "$RUNNER_TEMP/apvenv/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "agentplane[bot]"
+          git config user.email "agentplane@users.noreply.github.com"
+
+      - name: Execute
+        id: exec
+        run: |
+          set -o pipefail
+          mkdir -p "$AGENTPLANE_EVIDENCE_DIR"
+          # `ap exec` verifies changed paths (tier 3), writes the envelope, and
+          # opens the PR itself. A verification failure exits nonzero with no PR.
+          ap exec "$ISSUE" --tool "$TOOL" 2>&1 | tee exec.out
+          pr=$(sed -n 's/^PR: //p' exec.out | head -n1)
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentplane-run-${{ needs.resolve.outputs.digest }}
+          path: ${{ env.AGENTPLANE_EVIDENCE_DIR }}
+          if-no-files-found: warn
+
+      - name: Enable auto-merge
+        if: success() && env.GATE == 'auto' && steps.exec.outputs.pr != ''
+        run: gh pr merge "${{ steps.exec.outputs.pr }}" --auto --squash
+
+      - name: Post final status
+        if: always()
+        run: python -m agentplane.surface status "$ISSUE" --step ${{ job.status == 'success' && 'done' || 'failed' }}

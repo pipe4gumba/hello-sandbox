@@ -1,0 +1,71 @@
+# Hermes dry mapping — collision analysis, NOT runtime support.
+#
+# `ap lint` fails if any TaskSpec or policy field is missing here, so this
+# file must track contract evolution (agentplane/policy.py::_lint_dry_mappings).
+# Live Hermes is explicitly out of MVP scope and remains backlog until
+# concrete pressure promotes it; every classification below is unverified.
+runtime: Hermes (ephemeral task runtime)
+verified: false
+state: ephemeral
+caveat: >-
+  Hermes is `state: ephemeral`: no workspace outlives the attempt, so it carries
+  none of OpenClaw's session-memory leakage — and equally none of its persistence.
+  It also exposes no evidenced policy surface, so it collides harder than OpenClaw
+  on every constraint field: the run worktree plus tier-3 diff verification would be
+  the only enforcement in play. Nothing here has been observed against a live Hermes.
+
+taskspec:
+  v:
+    target: "prompt preamble line"
+    class: lossy
+    note: "No task-contract version concept; survives as prose, never validated."
+  domain:
+    target: "prompt role selection"
+    class: lossy
+    note: "Shapes the prompt only. Hermes has no domain authority and no policy binding."
+  tool:
+    target: "the Hermes runtime itself"
+    class: mapped
+    note: "Tool selection resolves to this runtime; the one field the mapping cannot lose."
+  runner:
+    target: "invoking host"
+    class: lossy
+    note: "Recorded in the envelope; the ephemeral runtime has nothing to bind it to."
+  context:
+    target: "prompt attachments"
+    class: lossy
+    note: "Injected per attempt. Ephemeral state means the context set is at least closed for that attempt."
+  paths.write:
+    target: "(none)"
+    class: unmapped
+    note: "No path-scoping concept evidenced. The per-run worktree, not Hermes, bounds writes."
+  acceptance:
+    target: "prompt acceptance criteria"
+    class: lossy
+    note: "Prose only; the runtime never checks it."
+
+policy:
+  gate:
+    target: "(none)"
+    class: unmapped
+    note: "Approval lives in GitHub; the runtime has no gate concept and cannot block itself."
+  capabilities:
+    target: "(none)"
+    class: unmapped
+    note: "No tool-permission surface evidenced, so capability caps could not even be prompt-scoped reliably."
+  write:
+    target: "(none)"
+    class: unmapped
+    note: "The domain write allowlist has no runtime representation; tier-3 diff verification is the whole control."
+  deny_context:
+    target: "files absent from the run checkout"
+    class: lossy
+    note: "Enforced by agentplane's sparse worktree, not by Hermes. Hides files from the checkout, not from Git history."
+  protect:
+    target: "(none)"
+    class: unmapped
+    note: "No protected-path concept. Violations are caught only after the fact, by diff verification."
+  runner:
+    target: "invoking host"
+    class: lossy
+    note: "Duplicate of taskspec.runner; recorded in the envelope, unenforceable at the runtime."

@@ -1,0 +1,40 @@
+# agentplane — plan-gate approval.
+#
+# Fires only when `gate:approved` lands on an issue that is actually waiting
+# for a plan approval. Both labels are required: approving something that was
+# never planned is a no-op, not an execution.
+name: agentplane gate
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  unlock:
+    if: >-
+      github.event.label.name == 'gate:approved' &&
+      contains(github.event.issue.labels.*.name, 'agent:awaiting-plan-ok')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Clear the waiting-for-plan flag
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --remove-label 'agent:awaiting-plan-ok'
+
+  # Same execution path as agent-run.yml — approval carries `approved: true`
+  # so the plan job does not re-post the plan it was just approved from.
+  execute:
+    needs: unlock
+    uses: ./.github/workflows/agent-run.yml
+    with:
+      issue: ${{ github.event.issue.number }}
+      approved: true
+    secrets: inherit

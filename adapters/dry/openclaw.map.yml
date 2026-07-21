@@ -1,0 +1,72 @@
+# OpenClaw dry mapping — collision analysis, NOT runtime support.
+#
+# `ap lint` fails if any TaskSpec or policy field is missing here, so this
+# file must track contract evolution (agentplane/policy.py::_lint_dry_mappings).
+# Classifications are deliberately pessimistic: the OpenClaw side is
+# unverified, and an optimistic `mapped` would read as an enforcement claim.
+runtime: OpenClaw (session workspace runtime)
+verified: false
+state: session
+caveat: >-
+  OpenClaw's markdown workspace is runtime-local memory, never a second task or
+  decision authority; GitHub remains the task authority and agentplane owns
+  bundles and envelopes. A governed OpenClaw runtime is P3 and evidence-gated.
+  Because the profile is `state: session`, workspace memory outlives any single
+  task: content agentplane excluded from one run can be reintroduced by the
+  session itself. Nothing here has been observed against a live OpenClaw.
+
+taskspec:
+  v:
+    target: "prompt preamble line"
+    class: lossy
+    note: "No task-contract version concept; survives as prose, never validated."
+  domain:
+    target: "session topic / prompt template selection"
+    class: lossy
+    note: "Domain is an agentplane policy key. OpenClaw has no domain authority, so it only shapes the prompt."
+  tool:
+    target: "the OpenClaw runtime itself"
+    class: mapped
+    note: "Tool selection resolves to this runtime; that is the one field the mapping cannot lose."
+  runner:
+    target: "session host"
+    class: lossy
+    note: "Sessions are long-lived and host-bound; runner x tool validity cannot be re-checked at the runtime."
+  context:
+    target: "workspace memory files and prompt attachments"
+    class: lossy
+    note: "Injected as references. Session memory may already hold excerpts, so the context set is not closed."
+  paths.write:
+    target: "workspace write scope"
+    class: lossy
+    note: "No per-glob enforcement; narrowed to the workspace root. Tier-3 diff verification stays the only real control."
+  acceptance:
+    target: "prompt acceptance criteria"
+    class: lossy
+    note: "Prose only; the runtime never checks it. The human gate does."
+
+policy:
+  gate:
+    target: "(none)"
+    class: unmapped
+    note: "Approval lives in GitHub. A session runtime cannot gate itself, and self-initiation is prohibited for governed runs."
+  capabilities:
+    target: "per-run tool configuration"
+    class: lossy
+    note: "Policy-derived per-run tool config is P3 and unverified; today capability caps would stay prompt-only (tier 2)."
+  write:
+    target: "workspace write scope"
+    class: lossy
+    note: "Same collision as paths.write: the allowlist degrades to a single writable root."
+  deny_context:
+    target: "files absent from the session workspace"
+    class: lossy
+    note: "Sparse checkout hides them from the run worktree, not from Git history and not from prior session memory."
+  protect:
+    target: "(none)"
+    class: unmapped
+    note: "No protected-path concept. Violations are caught only after the fact by tier-3 diff verification."
+  runner:
+    target: "session host"
+    class: lossy
+    note: "Duplicate of taskspec.runner; recorded in the envelope, unenforceable at the runtime."

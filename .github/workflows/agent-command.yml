@@ -1,0 +1,123 @@
+# agentplane — `/agent` comment commands.
+#
+# Commands are the retry affordance. Re-adding `agent:run` is not: the label
+# is already there, so no event fires. Authorization is author association,
+# checked before anything is parsed.
+name: agentplane command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  parse:
+    if: >-
+      github.event.issue.pull_request == null &&
+      startsWith(github.event.comment.body, '/agent') &&
+      contains(fromJSON('["OWNER","MEMBER"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    outputs:
+      cmd: ${{ steps.parse.outputs.cmd }}
+      issue: ${{ github.event.issue.number }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      BODY: ${{ github.event.comment.body }}
+    steps:
+      - name: Parse subcommand
+        id: parse
+        run: |
+          set -euo pipefail
+          cmd=$(printf '%s' "$BODY" | head -n1 | awk '{print $2}')
+          case "$cmd" in
+            run|replan|status|approve)
+              echo "cmd=$cmd" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "cmd=" >> "$GITHUB_OUTPUT"
+              cat > unknown.md <<EOF
+          \`/agent ${cmd:-(nothing)}\` is not a command. Valid commands:
+
+          - \`/agent run\` — execute (or re-execute) this task
+          - \`/agent replan\` — regenerate the plan comment
+          - \`/agent status\` — refresh the status comment
+          - \`/agent approve\` — approve the posted plan and execute
+          EOF
+              gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file unknown.md
+              ;;
+          esac
+
+  # replan and status only touch comments, so they share one lightweight job.
+  comment:
+    needs: parse
+    if: needs.parse.outputs.cmd == 'replan' || needs.parse.outputs.cmd == 'status'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ needs.parse.outputs.issue }}
+      AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
+      AGENTPLANE_TOKEN: ${{ secrets.AGENTPLANE_TOKEN }}
+      AGENTPLANE_EVIDENCE_DIR: ${{ github.workspace }}/.agentplane-evidence
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install agentplane
+        run: |
+          set -euo pipefail
+          # agentplane may itself live in a private repository. When
+          # AGENTPLANE_TOKEN is set, install over an authenticated URL; the
+          # token is never written to a variable or to the log.
+          install="$AGENTPLANE_INSTALL"
+          if [ -n "${AGENTPLANE_TOKEN:-}" ] && [ "${install#git+https://github.com/}" != "$install" ]; then
+            install="git+https://x-access-token:${AGENTPLANE_TOKEN}@github.com/${install#git+https://github.com/}"
+          fi
+          uv venv "$RUNNER_TEMP/apvenv"
+          VIRTUAL_ENV="$RUNNER_TEMP/apvenv" uv pip install "$install"
+          echo "$RUNNER_TEMP/apvenv/bin" >> "$GITHUB_PATH"
+      - name: Run the command
+        run: |
+          mkdir -p "$AGENTPLANE_EVIDENCE_DIR"
+          if [ "${{ needs.parse.outputs.cmd }}" = "replan" ]; then
+            python -m agentplane.surface plan "$ISSUE"
+          else
+            python -m agentplane.surface status "$ISSUE"
+          fi
+
+  # `/agent approve` records the decision as labels AND executes. Labels set by
+  # GITHUB_TOKEN do not trigger other workflows, so agent-gate.yml would never
+  # see this one — the execute job below is what actually runs the task.
+  approve:
+    needs: parse
+    if: needs.parse.outputs.cmd == 'approve'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ needs.parse.outputs.issue }}
+    steps:
+      - name: Record the approval
+        run: |
+          gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --add-label 'gate:approved' \
+            --remove-label 'agent:awaiting-plan-ok'
+
+  execute:
+    needs: [parse, approve]
+    if: needs.parse.outputs.cmd == 'approve'
+    uses: ./.github/workflows/agent-run.yml
+    with:
+      issue: ${{ needs.parse.outputs.issue }}
+      approved: true
+    secrets: inherit
+
+  rerun:
+    needs: parse
+    if: needs.parse.outputs.cmd == 'run'
+    uses: ./.github/workflows/agent-run.yml
+    with:
+      issue: ${{ needs.parse.outputs.issue }}
+    secrets: inherit
