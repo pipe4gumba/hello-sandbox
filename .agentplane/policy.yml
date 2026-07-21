@@ -1,0 +1,72 @@
+# agentplane policy — resolution precedence: labels > TaskSpec > domain defaults.
+# TaskSpec paths may narrow authority but never widen it.
+#
+# `ap init` writes this file once and never overwrites it. Edit freely, then
+# run `ap lint` (errors block; warnings teach) and `ap docs` (regenerates the
+# domain/gate/tool and enforcement tables from whatever is in here).
+
+defaults:
+  tool: claude-code
+  runner: self-hosted
+  gate: pr
+
+# Readable everywhere but never writable via agent runs, including by
+# otherwise privileged domains.
+protect:
+  - ".github/workflows/**"
+  - ".agentplane/**"
+  - "LICENSE"
+
+# Hidden from run checkouts (sparse checkout hides the checkout, not Git
+# history). Repository-root .agentplaneignore is merged in.
+deny_context:
+  - ".env*"
+  - "**/*.pem"
+  - "**/*.key"
+  - "secrets/**"
+
+domains:
+  docs:
+    gate: auto
+    tool: claude-code
+    runner: self-hosted
+    write: ["docs/**", "*.md"]
+    capabilities: ["Read", "Edit", "Write", "Bash(git *)"]
+    # deny_context: []            # domain-specific denies merge with the global list
+  code:
+    gate: pr
+    tool: claude-code
+    runner: self-hosted
+    write: ["src/**", "tests/**"]
+    capabilities: ["Read", "Edit", "Write", "Bash"]
+  ideation:
+    gate: plan
+    tool: claude-code
+    runner: self-hosted          # switch to a hosted lane (e.g. hosted-codex + codex) once verified
+    write: ["docs/proposals/**"]
+    capabilities: ["Read", "Write"]
+  infra:
+    gate: plan
+    tool: claude-code
+    runner: self-hosted
+    write: ["infra/**", "docs/plans/**"]
+    capabilities: ["Read", "Write"]
+
+# Runner × tool validity is policy data; the resolver fails closed on
+# pairs absent from these lists. Trim the lists to the lanes you have
+# actually provisioned — every entry here is an offer `ap resolve` accepts.
+runners:
+  hosted-copilot: {tools: [copilot]}
+  hosted-codex: {tools: [codex]}
+  # No `hosted-codex-litellm`: a LiteLLM gateway normally listens on the tools
+  # VM's loopback, which a GitHub-hosted runner can never reach. Omitting the
+  # pair makes the resolver fail closed instead of offering a lane that hangs.
+  self-hosted: {tools: [claude-code, codex, codex-litellm, grok, opencode, pi]}
+  ghaw-demo: {tools: [ghaw]}
+  local-cli: {tools: [claude-code, codex, codex-litellm, grok, opencode, pi, openclaw, hermes]}
+
+gates:
+  auto: "merge on green"
+  pr: "human PR review"
+  plan: "plan comment approval (gate:approved or /agent approve), then retrigger"
+  human-live: "interactive human gating (CLI runs)"

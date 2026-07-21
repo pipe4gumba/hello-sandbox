@@ -1,0 +1,53 @@
+# Tool registry — adding a tool is configuration, not code.
+# TODO-verify placeholders are unverified commands and must stay verbatim
+# until real flags are evidenced (`ap tools` never reports them as working).
+#
+# `ap init` writes this file once and never overwrites it. Delete the tools
+# you will not run; every name left here becomes an `agent:tool/<name>` label
+# and an option in the issue form.
+tools:
+  claude-code:
+    detect: "claude --version"
+    # --verbose is mandatory: `claude -p --output-format stream-json` refuses
+    # to start without it (verified 2026-07-21, claude 2.1.216).
+    headless: "claude -p @{prompt_file} --output-format stream-json --verbose {tool_flags}"
+    interactive: "claude {tool_flags}"
+    parser: claude_stream_json
+    tool_flag_style: claude-allowed-tools
+    state: ephemeral
+  # `--sandbox workspace-write` is mandatory for any editing run: `codex exec`
+  # defaults to a read-only sandbox, and the agent reports the filesystem as `ro`
+  # and gives up rather than failing loudly (verified 2026-07-21). agentplane's
+  # per-run worktree plus tier-3 diff verification remain the real containment.
+  codex: {detect: "codex --version", headless: "codex exec --json --sandbox workspace-write @{prompt_file}", interactive: "codex", parser: generic, state: ephemeral}
+  # LiteLLM gateway lane. The gateway listens on loopback ONLY, so this tool is
+  # valid on `self-hosted` and `local-cli` and is unreachable from GitHub-hosted
+  # runners; `policy.yml` has no hosted runner for it on purpose.
+  #
+  # `extends: codex` + `env:` alone does NOT work: codex ignores OPENAI_BASE_URL
+  # and silently uses its own ChatGPT auth (verified 2026-07-21 — a run against a
+  # dead port still exited 0 and the gateway logged nothing). The provider must be
+  # declared with `-c`, and `wire_api` must be `responses`: codex 0.144 removed
+  # `chat`. The gateway serves no OpenAI models, so a model must be named.
+  codex-litellm:
+    extends: codex
+    headless: >-
+      codex exec --json --skip-git-repo-check --sandbox workspace-write
+      -c model_provider=litellm
+      -c 'model_providers.litellm={name="LiteLLM",base_url="http://127.0.0.1:4000/v1",env_key="LITELLM_KEY",wire_api="responses"}'
+      -m minimax-m2.5
+      @{prompt_file}
+    interactive: >-
+      codex
+      -c model_provider=litellm
+      -c 'model_providers.litellm={name="LiteLLM",base_url="http://127.0.0.1:4000/v1",env_key="LITELLM_KEY",wire_api="responses"}'
+      -m minimax-m2.5
+    env: {LITELLM_KEY: "${LITELLM_KEY}"}
+  # Verified 2026-07-21 by real runs that wrote files; see 3.4-human-checklist.md.
+  grok: {detect: "grok --version", headless: "grok --prompt-file {prompt_file} --output-format json --permission-mode acceptEdits", interactive: "grok", parser: generic, state: ephemeral}
+  opencode: {detect: "opencode --version", headless: "opencode run --format json --auto 'Follow the attached instructions.' -f {prompt_file}", interactive: "opencode", parser: generic, state: ephemeral}
+  pi: {detect: "pi --version", headless: "pi -p --mode json @{prompt_file}", interactive: "pi", parser: generic, state: ephemeral}
+  copilot: {kind: dispatch}
+  ghaw: {kind: dispatch}
+  openclaw: {kind: dry, mapping: adapters/dry/openclaw.map.yml, state: session}
+  hermes: {kind: dry, mapping: adapters/dry/hermes.map.yml, state: ephemeral}
