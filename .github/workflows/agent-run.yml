@@ -41,6 +41,7 @@ jobs:
     outputs:
       issue: ${{ inputs.issue || github.event.issue.number }}
       skip: ${{ steps.guard.outputs.skip }}
+      approved: ${{ steps.guard.outputs.approved }}
       runner: ${{ steps.bundle.outputs.runner }}
       tool: ${{ steps.bundle.outputs.tool }}
       gate: ${{ steps.bundle.outputs.gate }}
@@ -51,16 +52,24 @@ jobs:
       AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
       AGENTPLANE_SSH_KEY: ${{ secrets.AGENTPLANE_SSH_KEY }}
     steps:
-      - name: Skip completed issues
+      - name: Read issue labels
         id: guard
         run: |
           set -euo pipefail
-          if gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels \
-               -q '.labels[].name' | grep -qx 'agent:done'; then
+          labels=$(gh issue view "$ISSUE" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name')
+          if grep -qx 'agent:done' <<< "$labels"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "::notice title=agentplane::Issue #$ISSUE carries agent:done, so agentplane skipped it. Remove agent:done to run it again."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          # An approved plan is a label on the issue, not only an input to
+          # this workflow. `ap run` reads the same label, so a `/agent run`
+          # after an approval executes instead of re-posting the plan.
+          if [ "${{ inputs.approved }}" = "true" ] || grep -qx 'gate:approved' <<< "$labels"; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "approved=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v4
@@ -112,7 +121,7 @@ jobs:
   # nothing is executed until gate:approved (or /agent approve) arrives.
   plan:
     needs: resolve
-    if: needs.resolve.outputs.skip != 'true' && needs.resolve.outputs.gate == 'plan' && inputs.approved != true
+    if: needs.resolve.outputs.skip != 'true' && needs.resolve.outputs.gate == 'plan' && needs.resolve.outputs.approved != 'true'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -149,19 +158,30 @@ jobs:
         with:
           name: agentplane-plan-${{ needs.resolve.outputs.digest }}
           path: ${{ env.AGENTPLANE_EVIDENCE_DIR }}
-          if-no-files-found: warn
+          # The evidence directory is dot-prefixed, and upload-artifact
+          # skips hidden paths by default — without this, every envelope is
+          # silently dropped and the only trace is a warning nobody reads.
+          include-hidden-files: true
+          if-no-files-found: error
 
   execute:
     needs: resolve
-    if: needs.resolve.outputs.skip != 'true' && (needs.resolve.outputs.gate != 'plan' || inputs.approved == true)
+    if: needs.resolve.outputs.skip != 'true' && (needs.resolve.outputs.gate != 'plan' || needs.resolve.outputs.approved == 'true')
     # Self-hosted lanes carry the tool binaries and long-lived credentials;
     # everything else stays on hosted runners.
     runs-on: ${{ needs.resolve.outputs.runner == 'self-hosted' && 'agent' || 'ubuntu-latest' }}
     env:
+      # Ambient auth for gh reads before the app token is minted (hosted
+      # runners have no other gh credential). Provider calls that carry the
+      # minted app token override this per-invocation, so PRs still open
+      # under the app identity.
       GH_TOKEN: ${{ github.token }}
       ISSUE: ${{ needs.resolve.outputs.issue }}
       TOOL: ${{ needs.resolve.outputs.tool }}
       GATE: ${{ needs.resolve.outputs.gate }}
+      AGENTPLANE_APP: agentplane-ci
+      AGENTPLANE_AGENTPLANE_CI_APP_ID: ${{ secrets.AGENTPLANE_CI_APP_ID }}
+      AGENTPLANE_AGENTPLANE_CI_PRIVATE_KEY: ${{ secrets.AGENTPLANE_CI_APP_PRIVATE_KEY }}
       AGENTPLANE_INSTALL: ${{ vars.AGENTPLANE_INSTALL || 'git+https://github.com/pipe4gumba/agentplane' }}
       AGENTPLANE_SSH_KEY: ${{ secrets.AGENTPLANE_SSH_KEY }}
       AGENTPLANE_EVIDENCE_DIR: ${{ github.workspace }}/.agentplane-evidence
@@ -196,10 +216,24 @@ jobs:
           rm -f "$RUNNER_TEMP/agentplane_key"
           echo "$RUNNER_TEMP/apvenv/bin" >> "$GITHUB_PATH"
 
-      - name: Configure git identity
+      # Git identity is set by agentplane when minting the app token, not here.
+
+      # Hosted runners carry no agent CLIs. Self-hosted runners carry their
+      # own, so this is a no-op there. Without it the lane fails closed with
+      # "not on PATH" — correct, but only after resolution has already run.
+      - name: Install the tool (hosted runners only)
+        if: needs.resolve.outputs.runner != 'self-hosted'
+        env:
+          NPM_PACKAGE: ${{ vars.AGENTPLANE_TOOL_NPM_codex || '@openai/codex' }}
         run: |
-          git config user.name "agentplane[bot]"
-          git config user.email "agentplane@users.noreply.github.com"
+          set -euo pipefail
+          case "$TOOL" in
+            codex|codex-litellm) npm install -g "$NPM_PACKAGE" ;;
+            claude-code)         npm install -g @anthropic-ai/claude-code ;;
+            *)
+              echo "::notice title=agentplane::No hosted install recipe for '$TOOL'; the lane will fail closed if the binary is absent."
+              ;;
+          esac
 
       - name: Execute
         id: exec
@@ -218,7 +252,11 @@ jobs:
         with:
           name: agentplane-run-${{ needs.resolve.outputs.digest }}
           path: ${{ env.AGENTPLANE_EVIDENCE_DIR }}
-          if-no-files-found: warn
+          # The evidence directory is dot-prefixed, and upload-artifact
+          # skips hidden paths by default — without this, every envelope is
+          # silently dropped and the only trace is a warning nobody reads.
+          include-hidden-files: true
+          if-no-files-found: error
 
       - name: Enable auto-merge
         if: success() && env.GATE == 'auto' && steps.exec.outputs.pr != ''
